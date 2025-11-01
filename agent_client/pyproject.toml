@@ -1,0 +1,21 @@
+[project]
+name = "agent-client"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "markdown-it-py>=4.0.0",
+    "mdit-py-plugins>=0.5.0",
+    "pygments>=2.19.2",
+    "pyside6>=6.9.3",
+]
+
+[tool.black]
+line-length = 119
+skip-string-normalization = true
+
+[tool.isort]
+profile = "black"
+known_first_party = ["server"] 
+line_length = 119
