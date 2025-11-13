@@ -4,8 +4,8 @@ from traceback import format_exc
 from uuid import uuid4
 
 from PySide6.QtCore import QByteArray, QObject, QUrl, Slot
-from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
-from PySide6.QtWebSockets import QWebSocket
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest  # 发送 HTTP 请求并处理响应
+from PySide6.QtWebSockets import QWebSocket  # 建立和管理 WebSocket 通信
 
 from .event_bus import event_bus
 
@@ -13,17 +13,22 @@ from .event_bus import event_bus
 class ClientAPI(QObject):
     '''客户端 API，与服务器进行网络通信'''
 
+    USER_ID = 'liling'
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._base_url = r'http://127.0.0.1:8000'
         self._current_thread_id = None
         self._llm_activated = False
 
-        self._access_manager = QNetworkAccessManager(self)  # 发送 HTTP 请求并处理响应
-        self._websocket = QWebSocket(parent=self)  # 建立和管理 WebSocket 通信
+        self._access_manager = QNetworkAccessManager(self)
+        self._chat_websocket = QWebSocket(parent=self)
+        self._notification_websocket = QWebSocket(parent=self)
 
         self._connect_signal()
         self._connect_websocket()
+
+        self._connect_notification_websocket()
 
     def _connect_signal(self):
         event_bus.llm_changed.connect(self._request_activate_llm)  # 接收
@@ -36,12 +41,17 @@ class ClientAPI(QObject):
         event_bus.new_chat_requested.connect(self._handle_new_chat_request)  # 接收
 
     def _connect_websocket(self):
-        self._websocket.disconnected.connect(self._websocket_disconnected)  # 行动
-        self._websocket.errorOccurred.connect(self._websocket_occur_error)  # 行动
+        # 对话 WebSocket
+        self._chat_websocket.disconnected.connect(self._chat_websocket_disconnected)  # 行动
+        self._chat_websocket.errorOccurred.connect(self._chat_websocket_occur_error)  # 行动
 
-        self._websocket.textMessageReceived.connect(self._websocket_communication)  # 行动
+        self._chat_websocket.textMessageReceived.connect(self._chat_websocket_communication)  # 行动
 
         event_bus.input_submitted.connect(self._submit_user_content)  # 接收
+
+        # 通知 WebSocket
+        self._notification_websocket.errorOccurred.connect(self._notification_websocket_occur_error)  # 行动
+        self._notification_websocket.textMessageReceived.connect(self._notification_websocket_communication)  # 行动
 
     # 辅助相关
     @Slot()
@@ -52,7 +62,7 @@ class ClientAPI(QObject):
             event_bus.occur_error.emit('请选择一个 LLM ！！！')
             return
 
-        self._close_websocket()
+        self._disconnect_chat_websocket()
         self._connect_chat_websocket(str(uuid4()))
 
     def _send_request(self, route: str, payload: dict | None = None) -> QNetworkReply:  # 网络回复，封装网络操作的回复
@@ -109,7 +119,7 @@ class ClientAPI(QObject):
             print(e)
         else:
             try:
-                self._close_websocket()
+                self._disconnect_chat_websocket()
                 chat = json.loads(reply.readAll().data().decode()).get('chat', [])
                 event_bus.chat_loaded.emit(chat)
                 self._connect_chat_websocket(thread_id)
@@ -165,80 +175,103 @@ class ClientAPI(QObject):
         reply = self._send_request(f'/load_chat/{thread_id}')
         reply.finished.connect(partial(self._chat_loaded, reply, thread_id))
 
-    # WebSocket 相关
+    # 对话 WebSocket 相关
     @Slot(str)
     def _connect_chat_websocket(self, current_thread_id: str):
-        '''连接 WebSocket'''
-
         self._current_thread_id = current_thread_id
-
-        if self._websocket.isValid():
-            self._websocket.close()
-
-        self._websocket.open(QUrl(f'ws://{self._base_url.split('//')[1]}/ws/chat/{current_thread_id}'))
+        if self._chat_websocket.isValid():
+            self._chat_websocket.close()
+        self._chat_websocket.open(QUrl(f'ws://{self._base_url.split('//')[1]}/ws/chat/{current_thread_id}'))
 
     @Slot()
-    def _close_websocket(self):
-        '''关闭 WebSocket'''
-
+    def _disconnect_chat_websocket(self):
         event_bus.input_ready.emit(False)
-
         self._current_thread_id = None
-
-        if self._websocket.isValid():
-            self._websocket.close()
+        if self._chat_websocket.isValid():
+            self._chat_websocket.close()
 
     @Slot()
-    def _websocket_disconnected(self):
-        '''WebSocket 断开连接'''
+    def _chat_websocket_disconnected(self):
+        '''对话 WebSocket 断开了连接'''
 
         event_bus.input_ready.emit(False)
-
         self._current_thread_id = None
 
     @Slot()
-    def _websocket_occur_error(self):
-        '''WebSocket 报错'''
+    def _chat_websocket_occur_error(self):
+        '''对话 WebSocket 报错'''
 
-        e = f'<_websocket_occur_error> WebSocket 报错！！！\n{self._websocket.errorString()}'
-        event_bus.occur_error.emit(e)
+        event_bus.occur_error.emit(
+            f'<_chat_websocket_occur_error> 对话 WebSocket 报错！！！\n{self._chat_websocket.errorString()}'
+        )
 
     @Slot(str)
     def _submit_user_content(self, content: str):
         '''发送用户输入'''
 
-        if self._websocket.isValid() and self._current_thread_id:
-            self._websocket.sendTextMessage(content)
+        if self._chat_websocket.isValid() and self._current_thread_id:
+            self._chat_websocket.sendTextMessage(content)
             event_bus.input_ready.emit(False)
         else:
             event_bus.occur_error.emit(
-                '<send_user_content> 无法发送用户输入，WebSocket 连接无效 或 当前 thread_id 不存在！！！'
+                '<send_user_content> 无法发送用户输入，对话 WebSocket 连接无效或当前 thread_id 不存在！！！'
             )
 
     @Slot(str)
-    def _websocket_communication(self, reply: str):
-        '''WebSocket 通信'''
-
-        print(f"--- CLIENT RECEIVED MESSAGE: {reply} ---")
+    def _chat_websocket_communication(self, reply: str):
+        '''对话 WebSocket 通信'''
 
         try:
             reply = json.loads(reply)
-            reply_type = reply['type']
+            type = reply['type']
             payload = reply['payload']
-
-            match reply_type:
+            match type:
                 case 'ai_message_chunk':
                     event_bus.ai_message_chunk_received.emit(payload)
                 case 'graph_operate_log':
                     event_bus.graph_operate_logged.emit(payload)
+                case _:
+                    event_bus.occur_error.emit('<_chat_websocket_communication> 对话 WebSocket 通信收到未知信息！')
+        except Exception:
+            event_bus.occur_error.emit(
+                f'<_chat_websocket_communication> 对话 WebSocket 通信报错！！！\n{format_exc()}'
+            )
+
+    # 通知 WebSocket 相关
+    @Slot()
+    def _connect_notification_websocket(self):
+        self._notification_websocket.open(QUrl(f'ws://{self._base_url.split('//')[1]}/ws/notification/{self.USER_ID}'))
+
+    @Slot()
+    def _notification_websocket_occur_error(self):
+        '''通知 WebSocket 报错'''
+
+        event_bus.occur_error.emit(
+            f'<_notification_websocket_occur_error> 通知 WebSocket 报错！！！\n{self._notification_websocket.errorString()}'
+        )
+
+    @Slot(str)
+    def _notification_websocket_communication(self, reply: str):
+        '''通知 WebSocket 通信'''
+
+        try:
+            reply = json.loads(reply)
+            type = reply['type']
+            payload = reply['payload']
+            match type:
                 case 'input_ready':
                     event_bus.input_ready.emit(payload)
                 case 'occur_error':
                     event_bus.occur_error.emit(payload)
                 case 'chat_title_generated':
                     event_bus.chat_history_load_requested.emit()
+                case 'remind_task':
+                    event_bus.occur_error.emit(f'！！！提醒！！！\n{payload}')
                 case _:
-                    event_bus.occur_error.emit('<_websocket_communication> WebSocket 通信收到未知信息！')
+                    event_bus.occur_error.emit(
+                        '<_notification_websocket_communication> 通知 WebSocket 通信收到未知信息！'
+                    )
         except Exception:
-            e = f'<_websocket_communication> WebSocket 通信报错！！！\n{format_exc()}'
-            event_bus.occur_error.emit(e)
+            event_bus.occur_error.emit(
+                f'<_notification_websocket_communication> 通知 WebSocket 通信报错！！！\n{format_exc()}'
+            )

@@ -1,5 +1,5 @@
 import logging
-from asyncio import Queue, create_task, to_thread
+from asyncio import Event, Queue, create_task, to_thread
 from pathlib import Path
 from textwrap import dedent
 
@@ -20,6 +20,7 @@ from psycopg_pool import AsyncConnectionPool
 from .assist import (
     DurableReflectionExecutor,
     EpisodeMemory,
+    RemindTaskManager,
     StateChangeEvent,
     chat_title_executor,
     connect_deepseek_llm,
@@ -52,16 +53,21 @@ class Agent:
         '''
     )
 
-    def __init__(self, config: Config, state_change_event_queue: Queue):
+    def __init__(self, config: Config, state_change_event_queue: Queue, remind_task_scheduler_wakeup_event: Event):
         self._config: Config | None = config
-        self._state_change_event_queue: Queue | None = state_change_event_queue
-        self._chat_title_executor_set: set[str] | None = set()
 
+        # 状态相关
+        self._state_change_event_queue: Queue | None = state_change_event_queue
         self._graph_readied: bool = False
         self._llm_activated: bool = False
 
-        self._after_seconds = 60 * 3
+        # 提醒任务相关
+        self._remind_task_scheduler_wakeup_event: Event | None = remind_task_scheduler_wakeup_event
 
+        # 对话标题相关
+        self._chat_title_executor_set: set[str] | None = set()
+
+        # 初始化相关
         self._init_variable_about_postgres()
         self._init_variable_about_graph()
         self._init_variable_about_episode_memory()
@@ -117,6 +123,7 @@ class Agent:
                 temporary_postgres = AsyncPostgresStore(conn, index=self._postgres_index_config)
                 await temporary_postgres.setup()
                 await AsyncPostgresSaver(conn).setup()
+                await RemindTaskManager.setup(conn)
 
             logger.info('<_init_postgres> 初始化数据库连接池')
             self._postgres_connection_pool = AsyncConnectionPool(
@@ -140,13 +147,22 @@ class Agent:
 
         self._graph = None
 
+        # 提醒任务相关
+        self._remind_task_manager: RemindTaskManager | None = None  # 提醒任务管理器
+
     async def _compile_graph(self):
         '''编译图'''
 
         try:
             logger.info('<_compile_graph> 编译图')
             if self._async_postgres_saver:
-                graph_builder = await create_main_graph_builder(chat_node, self._llm_bind_tools, self._mcp_tools)
+                self._remind_task_manager = RemindTaskManager(
+                    self._postgres_connection_pool, self._remind_task_scheduler_wakeup_event
+                )
+
+                graph_builder = await create_main_graph_builder(
+                    chat_node, self._llm_bind_tools, self._remind_task_manager, self._mcp_tools
+                )
                 self._graph = graph_builder.compile(self._async_postgres_saver)
 
                 self._graph_readied = True
@@ -158,6 +174,7 @@ class Agent:
             raise
 
     def _init_variable_about_episode_memory(self):
+        self._after_seconds = 60 * 3
         self._episode_memory_count: int = 0  # 情景记忆计数
         self._is_first_handle_episode_memory = True
 
@@ -228,11 +245,11 @@ class Agent:
                 logger.info('<activate_mcp_client> 创建多服务器 MCP 客户端')
 
                 project_path = Path(__file__).resolve().parents[3]
-                mcp_erver_cwd = project_path / 'mcp_server'
-                mcp_erver_script_path = mcp_erver_cwd / 'src' / 'mcp_server' / 'mcp_server.py'
+                mcp_server_cwd = project_path / 'mcp_server'
+                mcp_server_script_path = mcp_server_cwd / 'src' / 'mcp_server' / 'mcp_server.py'
 
-                if not mcp_erver_script_path.exists():
-                    e = f'<activate_mcp_client> MCP 服务器脚本不存在，请检查: {mcp_erver_script_path}'
+                if not mcp_server_script_path.exists():
+                    e = f'<activate_mcp_client> MCP 服务器脚本不存在，请检查: {mcp_server_script_path}'
                     logger.error(e)
                     raise FileNotFoundError(e)
 
@@ -243,9 +260,9 @@ class Agent:
                             'command': 'uv',
                             'args': [
                                 'run',
-                                str(mcp_erver_script_path),
+                                str(mcp_server_script_path),
                             ],
-                            'cwd': str(mcp_erver_cwd),
+                            'cwd': str(mcp_server_cwd),
                         }
                     }
                 )
@@ -515,6 +532,7 @@ class Agent:
             if self._graph_readied:
                 logger.info('<clean> 清理图')
                 self._graph_readied = False
+                self._remind_task_manager = None
                 self.graph = None
 
             if self._async_postgres_saver:

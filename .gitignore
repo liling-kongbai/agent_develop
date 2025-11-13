@@ -26,3 +26,6 @@ wheels/
 # OS-generated files
 Thumbs.db
 .DS_Store
+
+# 学习-微舆
+agent_server/study_BettaFish

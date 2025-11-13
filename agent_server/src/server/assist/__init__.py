@@ -1,4 +1,5 @@
-from .assist import chat_title_executor, connect_deepseek_llm, connect_ollama_llm
+from .assist import chat_title_executor, connect_deepseek_llm, connect_ollama_llm, remind_task_scheduler
 from .durable_reflection import DurableReflectionExecutor
+from .remind_task_manager import RemindTaskManager
 from .type import ActivationRequest, EpisodeMemory, LLMActivationRequest, StateChangeEvent
 from .websocket_connection_manager import WebSocketConnectionManager
